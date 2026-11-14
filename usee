@@ -12,161 +12,350 @@
   usee kill NAME             close NAME
   usee hook                  Claude Code PreToolUse hook: routes Bash tool calls into a shared terminal
 """
+# ─── The big picture ───────────────────────────────────────────────────────────
+# Problem: when Claude Code runs shell commands, it uses its own hidden shell. The
+# human can't watch those commands, type into them, or stop them.
+#
+# Solution: every "terminal" here is a tmux session. tmux keeps a shell running
+# in the background that any number of clients can attach to at the same time:
+#   * The human attaches with a normal terminal window (Terminal.app, iTerm, VS
+#     Code's terminal) and sees and types exactly as usual.
+#   * Claude never attaches. It drives the same session from outside with tmux
+#     commands: `send-keys` / `paste-buffer` to type, and `capture-pane` to read
+#     what's on screen.
+# Both are looking at the one same shell, so control is truly shared.
+#
+# How Claude ends up using this automatically: Claude Code lets you register a
+# "PreToolUse hook", a program that runs before each tool call and can rewrite
+# it. `usee hook` rewrites every Bash tool call from `CMD` into
+# `usee run <scratch-terminal> CMD`, so the command is typed into a visible
+# terminal and its output and exit code still flow back to Claude like before.
+#
+# The trickiest part is `run`: after typing a command into an interactive
+# shell, how do we know when it finished, what its exit code was, and which
+# lines on screen were its output? See SETUP below and the `run` function.
+# ───────────────────────────────────────────────────────────────────────────────
 import json, os, re, shlex, subprocess, sys, tempfile, time
 
+# Absolute path of this script (symlinks resolved). Used when opening a window
+# that needs to run `usee attach ...` without relying on PATH.
 EXE = os.path.realpath(__file__)
+# Folder for small "exit code" files, one per terminal (see SETUP). Lives in the
+# OS temp dir, so it's per user and wiped on reboot.
 RC_DIR = os.path.join(tempfile.gettempdir(), "usee")
+# Names tmux reports as the foreground program when a terminal is idle at its
+# prompt. A leading "-" means a login shell. Anything else (node, python,
+# sleep...) means the terminal is busy running something.
 SHELLS = {"zsh", "-zsh", "bash", "-bash", "sh"}
 # Records each command's exit status at every prompt, so `run` knows when it finished.
+#
+# This line is typed once into every new terminal. Piece by piece:
+#   " "                        leading space: with zsh's HIST_IGNORE_SPACE this
+#                              setup line stays out of the user's shell history.
+#   __usee_rc(){ ... }         defines a tiny shell function...
+#   print -r -- $? >| $USEE_RC ...that writes the last command's exit status ($?)
+#                              to the file named in $USEE_RC (set per terminal
+#                              in `new`). `>|` overwrites even if noclobber is on.
+#   precmd_functions+=(...)    zsh runs every function in this list right before
+#                              it draws a new prompt, i.e. right after any
+#                              command finishes.
+#   clear                      wipe the screen so the user never sees this line.
+# Net effect: "the .rc file appeared" means "a command just finished, and the
+# file holds its exit code." `run` deletes the file, types a command, and waits
+# for the file to come back. (This relies on zsh, the macOS default shell.)
 SETUP = " __usee_rc(){ print -r -- $? >| $USEE_RC }; precmd_functions+=(__usee_rc); clear"
 
 
+# Run a tmux command against usee's own tmux server and return the result
+# (stdout, stderr, return code). `-L usee` selects a separate socket, so these
+# sessions never mix with the user's personal tmux sessions, and global options
+# set below (scrollback size, mouse) only affect usee terminals.
 def tm(*args, input=None):
     return subprocess.run(["tmux", "-L", "usee", *args], input=input, capture_output=True, text=True)
 
 
+# Ask tmux for a piece of information about a terminal, using tmux's format
+# language, e.g. "#{cursor_y}" (the cursor row) or "#{pane_current_command}".
+# Target syntax: "=NAME" means "the session named exactly NAME" (no prefix
+# matching), and the trailing ":" means "its current window/pane".
 def fmt(name, f):
     return tm("display", "-p", "-t", f"={name}:", f).stdout.strip()
 
 
+# True if a terminal (tmux session) with exactly this name is running.
 def exists(name):
     return tm("has-session", "-t", f"={name}").returncode == 0
 
 
+# Where a terminal's exit-code file lives, e.g. $TMPDIR/usee/backend.rc
 def rc_path(name):
     return os.path.join(RC_DIR, name + ".rc")
 
 
+# Wait up to `secs` seconds for the terminal's exit-code file to appear, which
+# means the command finished (see SETUP). Returns True if it finished, False
+# on timeout or if the terminal disappeared.
 def wait_rc(name, secs):
     end, i = time.time() + secs, 0
     while time.time() < end:
         if os.path.exists(rc_path(name)):
             return True
+        # Roughly once a second, check the terminal still exists. If the
+        # command ended the shell (e.g. `exit`), no prompt will ever come back,
+        # so stop waiting instead of hanging until the timeout.
         i += 1
         if i % 20 == 0 and not exists(name):
             return False
+        # Poll 20 times per second: fast enough to feel instant, cheap enough
+        # not to matter.
         time.sleep(0.05)
     return False
 
 
+# Pop up a real window attached to the terminal, so the human sees it without
+# doing anything.
 def open_window(name):
     # USEE_OPEN="" disables; otherwise a shell template with {name}, e.g. for iTerm.
     tpl = os.environ.get("USEE_OPEN")
+    # Explicitly set to empty: don't open anything (useful for scripts and tests).
     if tpl == "":
         return
+    # A custom launcher command, with {name} filled in (shell-quoted for safety).
     if tpl:
         subprocess.run(tpl.format(name=shlex.quote(name)), shell=True)
         return
+    # Default: use AppleScript to ask macOS Terminal.app to open a new window
+    # that runs `usee attach NAME`, then bring Terminal to the front. The first
+    # time, macOS may ask permission for this ("automation" privacy prompt).
     script = f"{shlex.quote(EXE)} attach {shlex.quote(name)}"
     subprocess.run(["osascript", "-e", f'tell application "Terminal" to do script "{script}"',
                     "-e", 'tell application "Terminal" to activate'], capture_output=True)
 
 
+# Create a new shared terminal named NAME, starting in folder `cwd` (default:
+# the current folder). Does nothing if it already exists, so callers can call
+# it freely to mean "make sure this terminal exists".
 def new(name, cwd=None):
     if exists(name):
         return
+    # Prepare the exit-code file location and remove any stale file from a
+    # previous terminal with the same name, so we can detect when setup is done.
     os.makedirs(RC_DIR, exist_ok=True)
     rc = rc_path(name)
     if os.path.exists(rc):
         os.remove(rc)
+    # One tmux invocation with several commands separated by ";":
+    #   start-server               make sure usee's tmux server is up, so the
+    #                              global options below can be set.
+    #   history-limit 50000        keep 50k lines of scrollback (default 2000),
+    #                              so long command output can still be read back.
+    #   mouse on                   let the human scroll and click with the mouse.
+    #   new-session -d             create the session detached (no window yet),
+    #     -s name                  with this name,
+    #     -x 200 -y 50             a roomy default size until someone attaches
+    #                              (it then resizes to their window),
+    #     -c cwd                   starting in this folder,
+    #     -e USEE_RC=...           and this env var, telling SETUP's function
+    #                              where to write exit codes.
     r = tm("start-server", ";", "set", "-g", "history-limit", "50000", ";", "set", "-g", "mouse", "on", ";",
            "new-session", "-d", "-s", name, "-x", "200", "-y", "50", "-c", cwd or os.getcwd(), "-e", f"USEE_RC={rc}")
     if r.returncode:
         sys.exit(f"usee: {r.stderr.strip()}")
+    # Type the SETUP line into the new shell (-l = literal text, no key-name
+    # interpretation) and press Enter. If the shell is still starting up, the
+    # keystrokes wait in the terminal's input buffer until it's ready.
     tm("send-keys", "-t", f"={name}:", "-l", SETUP)
     tm("send-keys", "-t", f"={name}:", "Enter")
+    # SETUP finishing triggers the first prompt, which writes the .rc file, so
+    # its appearance means "shell is ready and instrumented."
     wait_rc(name, 10)
+    # `clear` wiped the visible screen, but tmux still keeps the setup line in
+    # its scrollback. Drop the scrollback so the user starts with a clean slate.
     tm("clear-history", "-t", f"={name}:")
     # Prompt lines above the input line (multi-line prompts), trimmed from `run` output.
+    # Right after `clear` the cursor sits on the prompt's input line. Its row
+    # number equals how many extra lines the prompt takes above it (0 for a
+    # one-line prompt). Saved as a custom tmux option (@usee_ph = "prompt
+    # height") on the session so `run` can read it later.
     tm("set", "-t", f"={name}", "@usee_ph", fmt(name, "#{cursor_y}") or "0")
     open_window(name)
 
 
+# Type TEXT into the terminal and press Enter, without waiting for anything.
+# Used directly by `usee send` (e.g. starting a dev server) and by `run`.
 def paste(name, text):
+    # Load the text into a tmux paste buffer (read from stdin via "-"). Each
+    # terminal gets its own buffer name so concurrent pastes don't collide.
+    # Trailing newlines are removed; we press Enter ourselves below.
     buf = f"usee-{name}"
     tm("load-buffer", "-b", buf, "-", input=text.rstrip("\n"))
+    # Paste it as if the user pasted with the mouse. -p wraps it in "bracketed
+    # paste" markers, which tell zsh "this is pasted text": a multi-line command
+    # then lands in the prompt as one unit instead of each line running as you
+    # go. -d deletes the buffer afterwards.
     tm("paste-buffer", "-p", "-d", "-b", buf, "-t", f"={name}:")  # bracketed paste: multi-line stays one command
+    # Press Enter to execute what was pasted.
     tm("send-keys", "-t", f"={name}:", "Enter")
 
 
+# The core: type CMD into terminal NAME, wait for it to finish (at most `secs`
+# seconds), print the output it produced, and exit with the command's own exit
+# code. To the caller (Claude), this behaves like running CMD directly, except
+# it happened in a terminal the human can see.
 def run(name, cmd, secs=115):
+    # Make sure the terminal exists (creates it, and its window, on first use).
     new(name)
     # ponytail: busy = foreground process isn't a shell; a user typing at the prompt mid-run can still interleave.
+    # Refuse to type into a terminal that's in the middle of something (a dev
+    # server, a previous command that timed out): the keystrokes would go to
+    # that program instead of the shell. Exit with an actionable message.
     cur = fmt(name, "#{pane_current_command}")
     if cur not in SHELLS:
         sys.exit(f"usee: terminal '{name}' is busy running '{cur}'. "
                  f"Wait, check it with `usee read {name}`, or interrupt with `usee key {name} C-c`.")
+    # Remember where the cursor is right now, as an absolute line number:
+    # history_size = lines scrolled off the top, cursor_y = row on screen. Their
+    # sum is the line the command is about to be typed on. Later we read
+    # everything from this line down to find the output.
     h1, y1 = map(int, fmt(name, "#{history_size} #{cursor_y}").split())
+    # Delete the exit-code file. The prompt that follows our command recreates
+    # it (see SETUP), which is how we detect completion.
     if os.path.exists(rc_path(name)):
         os.remove(rc_path(name))
+    # Type the command and press Enter.
     paste(name, cmd)
+    # Wait for the next prompt (= the command finished) or the timeout.
     done = wait_rc(name, secs)
+    # If the command closed the shell (e.g. `exit`), tmux destroys the session
+    # and there's nothing left to read.
     if not exists(name):
         sys.exit(f"usee: terminal '{name}' exited (the command ended its shell). Output is gone with it.")
+    # Where is the cursor now? Output may have scrolled lines into history.
     h2, y2 = map(int, fmt(name, "#{history_size} #{cursor_y}").split())
     # ponytail: output is scraped from the screen; a `clear` inside the command loses what came before it.
+    # capture-pane numbers lines relative to the top of the visible screen
+    # (0 = top row, negative = scrollback). Convert the saved absolute start
+    # line into that numbering using the *current* history size.
     start = h1 + y1 - h2
+    # Last line to capture:
+    #  - finished: stop just above the new prompt. y2 is the new prompt's input
+    #    line; subtract the prompt's extra lines (@usee_ph) and one more.
+    #  - still running: take everything up to the cursor.
     end = y2 - int(fmt(name, "#{@usee_ph}") or 0) - 1 if done else y2
+    # Grab that range of screen text. -p prints to stdout, and -J re-joins
+    # lines that were only wrapped because the window is narrow, so long lines
+    # come back whole. If the range is empty, there's no output.
     out = tm("capture-pane", "-p", "-J", "-t", f"={name}:", "-S", str(start), "-E", str(end)).stdout if end >= start else ""
+    # The first captured lines are the prompt plus the command as typed (one
+    # line per line of the command). Skip those, keep just the output, and drop
+    # trailing blank lines.
     text = "\n".join(out.splitlines()[cmd.count("\n") + 1:]).rstrip()
     if text:
         print(text)
+    # Timed out: the command keeps running visibly in the terminal (the human
+    # can watch or stop it). Tell the caller how to follow up, and exit 124,
+    # the conventional "timed out" status (same as GNU `timeout`).
     if not done:
         print(f"\n[usee: still running in terminal '{name}' after {secs}s. "
               f"`usee read {name}` to check, `usee key {name} C-c` to stop.]")
         sys.exit(124)
+    # Finished: exit with the command's real exit status, read from the file
+    # SETUP's function wrote, so failures look like failures to the caller.
     with open(rc_path(name)) as f:
         sys.exit(int(f.read().strip() or 0))
 
 
+# Print the last LINES lines of a terminal (screen plus scrollback), e.g. to
+# check on a dev server's logs.
 def read(name, lines=100):
+    # -S -N starts N lines up in scrollback (plus the whole visible screen),
+    # -J joins wrapped lines.
     out = tm("capture-pane", "-p", "-J", "-t", f"={name}:", "-S", f"-{lines}")
     if out.returncode:
         sys.exit(f"usee: {out.stderr.strip()}")
+    # Trim the blank rows below the cursor, then keep only the last N lines.
     print("\n".join(out.stdout.rstrip().splitlines()[-lines:]))
 
 
+# Claude Code PreToolUse hook. Configured in ~/.claude/settings.json to run
+# before every Bash tool call. Claude Code sends a JSON description of the call
+# on stdin. We answer on stdout:
+#   * print nothing     -> let the call run unchanged,
+#   * "deny" + reason   -> block it; Claude sees the reason and adapts,
+#   * "updatedInput"    -> replace the command with our rewritten one.
+# We don't set a permission decision when rewriting, so Claude Code's normal
+# permission rules and prompts still apply (to the rewritten command).
 def hook():
     data = json.load(sys.stdin)
-    ti = data.get("tool_input", {})
+    ti = data.get("tool_input", {})  # the Bash tool's arguments: command, timeout, ...
     cmd = ti.get("command", "")
+    # If the command already starts with `usee` (bare or a full path), Claude
+    # is deliberately driving a terminal (e.g. `usee send backend ...`). Let it
+    # through, or we'd wrap usee in usee.
     first = cmd.split(None, 1)[:1]
     if first and os.path.basename(first[0]) == "usee":
         return  # Claude is already driving a shared terminal explicitly
+    # The Bash tool's "run in background" mode starts an invisible process,
+    # which is exactly what this tool exists to prevent. Block it and tell
+    # Claude to use a named, visible terminal instead.
     if ti.get("run_in_background"):
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
             "permissionDecisionReason": "No hidden background processes. Run it in a shared terminal the user can see: "
                                         "`usee new <name>` then `usee send <name> '<cmd>'`, and check it with `usee read <name>`."}}))
         return
+    # Pick the scratch terminal for this chat. One per conversation, so all of
+    # Claude's small commands (git status, ls, ...) reuse a single terminal
+    # instead of spawning dozens:
+    #   project = folder name of the project Claude Code was opened in,
+    #   who     = the chat's session id, or a subagent's own id (so parallel
+    #             subagents don't fight over one terminal),
+    #   name    = e.g. "usee-insight-claude-f8bcc1", with characters tmux
+    #             doesn't allow in names (like "." and ":") replaced by "-".
     project = os.path.basename(os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or "claude")
     who = data.get("agent_id") or data.get("session_id") or "x"
     name = re.sub(r"[^\w-]", "-", f"{project}-claude-{who[:6]}")
+    # The Bash tool kills commands after its timeout (milliseconds, default 2
+    # minutes). Have `run` give up 5 seconds earlier, so it can report "still
+    # running" cleanly instead of being killed mid-way.
     secs = max(int(ti.get("timeout") or 120000) // 1000 - 5, 5)
+    # Replace the command with `usee run NAME 'CMD' SECS`, keeping all other
+    # tool arguments as they were. shlex.quote makes CMD a single safely-quoted
+    # argument, whatever quotes or special characters it contains.
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "updatedInput": {**ti, "command": f"usee run {name} {shlex.quote(cmd)} {secs}"}}}))
 
 
+# Command-line entry point: dispatch `usee <command> [args...]` to the
+# functions above. `a` is the argument list without the program name.
 def main(a):
+    # No arguments or asking for help: print the usage text at the top of the file.
     if not a or a[0] in ("-h", "--help"):
         sys.exit(__doc__)
     c, rest = a[0], a[1:]
+    # Commands that take no terminal name.
     if c == "hook": return hook()
     if c == "ls":
+        # One line per terminal: name, what's running in it, and its current folder.
         r = tm("list-panes", "-a", "-F", "#{session_name}\t#{pane_current_command}\t#{pane_current_path}")
         return print(r.stdout.rstrip() or "no terminals")
+    # Everything else needs a terminal name as the first argument.
     if not rest:
         sys.exit(__doc__)
     n = rest[0]
     if c == "new": return new(n, rest[1] if len(rest) > 1 else None)
     if c == "run": return run(n, rest[1], int(rest[2]) if len(rest) > 2 else 115)
     if c == "send": return paste(n, rest[1])
+    # Raw key names straight to tmux, e.g. `usee key backend C-c` for Ctrl-C.
     if c == "key": return tm("send-keys", "-t", f"={n}:", *rest[1:])
     if c == "read": return read(n, int(rest[1]) if len(rest) > 1 else 100)
+    # Replace this process with a tmux client, so the current terminal window
+    # becomes that shared terminal (detach with Ctrl-b then d).
     if c == "attach": os.execvp("tmux", ["tmux", "-L", "usee", "attach", "-t", f"={n}"])
     if c == "open": return open_window(n)
     if c == "kill": return tm("kill-session", "-t", f"={n}")
+    # Unknown command: show usage.
     sys.exit(__doc__)
 
 
